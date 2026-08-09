@@ -7,7 +7,7 @@ use kernel::KernelConnection;
 use pki_types::FipsStatus;
 
 use crate::common_state::{
-    CommonState, ConnectionOutput, ConnectionOutputs, Event, Output, OutputEvent,
+    CommonState, ConnectionOutput, ConnectionOutputs, Event, Output, OutputEvent, UnborrowedPayload,
 };
 use crate::crypto::cipher::{OutboundPlain, Payload};
 use crate::error::{ApiMisuse, Error};
@@ -300,6 +300,11 @@ impl<Side: SideData> DerefMut for ConnectionCommon<Side> {
 #[must_use]
 pub struct MessageHandler<'a, 'm, Side: SideData> {
     iter: MessageIter<'a, 'm, Side, SendPath>,
+    /// A payload of regular application data encountered by [`Self::next_early_data()`].
+    ///
+    /// This marks the end of the early data phase; the payload is held here until the
+    /// next [`Self::next_payload()`] call yields it.
+    pending: Option<UnborrowedPayload>,
     done: bool,
 }
 
@@ -311,6 +316,7 @@ impl<'a, 'm, Side: SideData> MessageHandler<'a, 'm, Side> {
     ) -> Self {
         Self {
             iter: MessageIter::new(input, tls, None, core),
+            pending: None,
             done: false,
         }
     }
@@ -340,8 +346,88 @@ impl<'a, 'm, Side: SideData> MessageHandler<'a, 'm, Side> {
     ///
     /// Should be called repeatedly until it returns `None`, at which point the input buffer no
     /// longer contains any complete messages and should be refilled by the application.
+    ///
+    /// Early ("0-RTT") data received by a server while the handshake is still in progress
+    /// is not yielded here; it is only available from
+    /// [`next_early_data()`][MessageHandler::next_early_data] and is dropped if
+    /// encountered by this method.
     pub fn next_payload(&mut self) -> Option<Result<Payload<'_>, Error>> {
+        if let Some(payload) = self.pending.take() {
+            return Some(Ok(
+                payload.reborrow(&Delocator::new(self.iter.input.slice_mut()))
+            ));
+        }
+
         if self.done {
+            return None;
+        }
+
+        loop {
+            let Some(result) = self.iter.next() else {
+                self.done = true;
+                return None;
+            };
+
+            let payload = match result {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.done = true;
+                    return Some(Err(err));
+                }
+            };
+
+            // A payload yielded while the handshake is still in progress is early
+            // ("0-RTT") data, which must not be conflated with regular application
+            // data: it is only surfaced via `next_early_data()`.
+            if !self.handshake_complete() {
+                continue;
+            }
+
+            return Some(Ok(
+                payload.reborrow(&Delocator::new(self.iter.input.slice_mut()))
+            ));
+        }
+    }
+
+    fn handshake_complete(&self) -> bool {
+        self.iter
+            .state()
+            .as_ref()
+            .map(|st| st.is_traffic())
+            .unwrap_or_default()
+    }
+
+    /// The I/O state of the connection after processing the last message.
+    pub fn state(self) -> IoState {
+        IoState::new(self.iter.recv)
+    }
+}
+
+impl<'a, 'm> MessageHandler<'a, 'm, ServerSide> {
+    /// Yields the next payload of early ("0-RTT") application data received from the client.
+    ///
+    /// Early data is only received during the handshake, from clients resuming an earlier
+    /// session, and only if the connection was configured with a non-zero
+    /// [`ServerConfig::max_early_data_size`][crate::ServerConfig::max_early_data_size].
+    ///
+    /// **Beware** that early data is subject to replay by an attacker; see [RFC 8446
+    /// appendix E.5][] for more detail.
+    ///
+    /// Call this until it returns `None` before processing regular application data with
+    /// [`next_payload()`][MessageHandler::next_payload] or
+    /// [`handle_all()`][MessageHandler::handle_all]: early data encountered by those
+    /// methods is dropped.
+    ///
+    /// `None` means no early data is currently available: the early data phase may have
+    /// ended, or processing may require further input.
+    ///
+    /// If this yields an error, stop calling it: the same error will also be reported by
+    /// [`next_payload()`][MessageHandler::next_payload] and
+    /// [`handle_all()`][MessageHandler::handle_all], so it can be ignored here.
+    ///
+    /// [RFC 8446 appendix E.5]: https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.5
+    pub fn next_early_data(&mut self) -> Option<Result<Payload<'_>, Error>> {
+        if self.done || self.pending.is_some() {
             return None;
         }
 
@@ -352,20 +438,21 @@ impl<'a, 'm, Side: SideData> MessageHandler<'a, 'm, Side> {
 
         let payload = match result {
             Ok(payload) => payload,
-            Err(err) => {
-                self.done = true;
-                return Some(Err(err));
-            }
+            // deliberately does not set `self.done`, so that the error is also
+            // yielded from `next_payload()`
+            Err(err) => return Some(Err(err)),
         };
+
+        // A payload yielded once the handshake has completed is regular application
+        // data: hold on to it for `next_payload()`.
+        if self.handshake_complete() {
+            self.pending = Some(payload);
+            return None;
+        }
 
         Some(Ok(
             payload.reborrow(&Delocator::new(self.iter.input.slice_mut()))
         ))
-    }
-
-    /// The I/O state of the connection after processing the last message.
-    pub fn state(self) -> IoState {
-        IoState::new(self.iter.recv)
     }
 }
 
@@ -498,7 +585,7 @@ pub(crate) struct SideCommonOutput<'a, 'q> {
 }
 
 impl<'q> Output<'_> for SideCommonOutput<'_, 'q> {
-    fn emit(&mut self, ev: Event<'_>) {
+    fn emit(&mut self, ev: Event) {
         self.side.emit(ev);
     }
 
@@ -560,7 +647,7 @@ pub(crate) mod private {
     }
 
     pub(crate) trait SideOutput {
-        fn emit(&mut self, ev: Event<'_>);
+        fn emit(&mut self, ev: Event);
     }
 }
 

@@ -515,7 +515,7 @@ struct CaptureAppData<'a, 'j, 'm, Send: SendOutput + 'a> {
 }
 
 impl<'a, 'm, Send: SendOutput + 'a> Output<'m> for CaptureAppData<'a, '_, 'm, Send> {
-    fn emit(&mut self, ev: Event<'_>) {
+    fn emit(&mut self, ev: Event) {
         self.other.side.emit(ev)
     }
 
@@ -585,7 +585,7 @@ impl ConnectionOutput for Discard {
 }
 
 impl SideOutput for Discard {
-    fn emit(&mut self, _ev: Event<'_>) {}
+    fn emit(&mut self, _ev: Event) {}
 }
 
 /// Tracking technically-allowed protocol actions
