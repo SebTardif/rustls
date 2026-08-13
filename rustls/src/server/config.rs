@@ -137,11 +137,15 @@ pub struct ServerConfig {
     /// Read the early data via
     /// [`ServerConnection::early_data()`][super::ServerConnection::early_data()].
     ///
-    /// The units for this are _both_ plaintext bytes, _and_ ciphertext
-    /// bytes, depending on whether the server accepts a client's early_data
-    /// or not.  It is therefore recommended to include some slop in
-    /// this value to account for the unknown amount of ciphertext
-    /// expansion in the latter case.
+    /// When early data is **accepted**, this limit is applied to plaintext
+    /// application data bytes (as in RFC 8446 / 9846).
+    ///
+    /// When early data is **rejected**, the server must still skip the
+    /// client's 0-RTT records.  Those skip paths observe ciphertext lengths,
+    /// so rustls adds a fixed AEAD overhead cushion (aligned with OpenSSL's
+    /// `EARLY_DATA_CIPHERTEXT_OVERHEAD`) on top of this value.  Applications
+    /// can therefore set this to the intended plaintext allowance without
+    /// manually padding for tags and content-type bytes on the reject path.
     pub max_early_data_size: u32,
 
     /// Whether the server should send "0.5RTT" data.  This means the server

@@ -25,8 +25,9 @@ use crate::error::{ApiMisuse, Error, InvalidMessage, PeerIncompatible, PeerMisbe
 use crate::hash_hs::HandshakeHash;
 use crate::msgs::{
     CERTIFICATE_MAX_SIZE_LIMIT, CertificatePayloadTls13, Codec, HandshakeMessagePayload,
-    HandshakePayload, KeyUpdateRequest, Message, MessagePayload, NewSessionTicketPayloadTls13,
-    PresharedKeyIdentity, Reader, ServerTicketRequestHint, SizedPayload,
+    HandshakePayload, KeyUpdateRequest, MAX_FRAGMENT_LEN, Message, MessagePayload,
+    NewSessionTicketPayloadTls13, PresharedKeyIdentity, Reader, ServerTicketRequestHint,
+    SizedPayload,
 };
 use crate::server::hs::ExpectClientHello;
 use crate::suites::PartiallyExtractedSecrets;
@@ -432,8 +433,20 @@ mod client_hello {
         Accepted { max_length: u32 },
     }
 
+    /// Budget for skipping rejected 0-RTT data (trial decryption and HRR skip).
+    ///
+    /// RFC 8446 / 9846 express `max_early_data_size` in **plaintext** application
+    /// data bytes. Both skip paths charge **ciphertext** body lengths (encrypted
+    /// record payloads), which include the TLS 1.3 inner content-type byte and
+    /// AEAD tag (and any padding). Convert with the same fixed overhead cushion
+    /// OpenSSL uses (`EARLY_DATA_CIPHERTEXT_OVERHEAD` in `ssl_local.h`): allowance
+    /// for several records' tag + content-type, plus 2 bytes they reserve for an
+    /// alert payload. Tag length 16 covers AES-GCM and ChaCha20-Poly1305.
     fn max_early_data_size(configured: u32) -> usize {
-        if configured != 0 {
+        // OpenSSL: ((6 * (EVP_GCM_TLS_TAG_LEN + 1)) + 2)
+        const EARLY_DATA_CIPHERTEXT_OVERHEAD: usize = 6 * (16 + 1) + 2;
+
+        let plaintext = if configured != 0 {
             configured as usize
         } else {
             // The relevant max_early_data_size may in fact be unknowable: if
@@ -442,9 +455,12 @@ mod client_hello {
             // reject early_data but need an upper bound on the amount of data
             // to drop.
             //
-            // Use a single maximum-sized message.
-            16384
-        }
+            // Use a single maximum-sized plaintext message (plus AEAD overhead
+            // below).
+            MAX_FRAGMENT_LEN.get()
+        };
+
+        plaintext.saturating_add(EARLY_DATA_CIPHERTEXT_OVERHEAD)
     }
 
     fn handle_psk_offer(

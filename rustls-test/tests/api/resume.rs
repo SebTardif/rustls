@@ -938,6 +938,161 @@ fn server_detects_excess_streamed_early_data() {
     );
 }
 
+/// When 0-RTT is rejected, the server trial-decrypts early-data records while
+/// charging ciphertext lengths against a budget derived from
+/// `max_early_data_size` (plaintext). A client that sends the full plaintext
+/// allowance produces more ciphertext (inner content-type + AEAD tag per
+/// record). The budget must cover that overhead so the 1-RTT handshake can
+/// complete instead of failing with `DecryptError`.
+#[test]
+fn rejected_early_data_full_allowance_completes_handshake() {
+    let kt = KeyType::default();
+    let provider = provider::DEFAULT_PROVIDER;
+    let early_data_size = 1234u32;
+    let session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+
+    let mut client_config = make_client_config(kt, &provider);
+    client_config.enable_early_data = true;
+    client_config.alpn_protocols = vec![b"h2".into(), b"http/1.1".into()];
+    client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+    let client_config = Arc::new(client_config);
+
+    // First connection: mint a ticket that allows early data under ALPN h2.
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.max_early_data_size = early_data_size;
+    server_config.alpn_protocols = vec![b"h2".into()];
+    server_config.session_storage = session_storage.clone();
+    let server_config = Arc::new(server_config);
+
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+    let mut client_output = Vec::new();
+    let mut server_output = Vec::new();
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&client_config, &server_config, &mut client_output);
+    do_handshake(
+        &mut client_input,
+        &mut client_output,
+        &mut client,
+        &mut server_input,
+        &mut server_output,
+        &mut server,
+    );
+
+    // Second connection: keep the same early-data limit so the trial-decrypt
+    // budget is tight, but change ALPN so early data is rejected. Share session
+    // storage so the PSK can still resume.
+    let mut reject_server_config = make_server_config(kt, &provider);
+    reject_server_config.max_early_data_size = early_data_size;
+    reject_server_config.alpn_protocols = vec![b"http/1.1".into()];
+    reject_server_config.session_storage = session_storage;
+    let reject_server_config = Arc::new(reject_server_config);
+
+    let mut client_output = Vec::new();
+    let mut server_output = Vec::new();
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&client_config, &reject_server_config, &mut client_output);
+
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        early_data_size as usize
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write_tls((&[0xaa; 1234]).into(), &mut client_output),
+        1234
+    );
+
+    do_handshake(
+        &mut client_input,
+        &mut client_output,
+        &mut client,
+        &mut server_input,
+        &mut server_output,
+        &mut server,
+    );
+
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert!(server.early_data().is_none());
+    assert!(!client.is_early_data_accepted());
+}
+
+/// Same interop requirement when the server has disabled early data entirely
+/// (`max_early_data_size = 0`) but the client still has a ticket that allows a
+/// full maximum-sized early-data record. The fallback skip budget must cover
+/// ciphertext for one max plaintext fragment, not only 16384 plaintext bytes.
+#[test]
+fn rejected_early_data_max_fragment_with_disabled_early_data() {
+    let kt = KeyType::default();
+    let provider = provider::DEFAULT_PROVIDER;
+    let early_data_size = 16_384u32;
+    let session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+
+    let mut client_config = make_client_config(kt, &provider);
+    client_config.enable_early_data = true;
+    client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.max_early_data_size = early_data_size;
+    server_config.session_storage = session_storage.clone();
+    let server_config = Arc::new(server_config);
+
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+    let mut client_output = Vec::new();
+    let mut server_output = Vec::new();
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&client_config, &server_config, &mut client_output);
+    do_handshake(
+        &mut client_input,
+        &mut client_output,
+        &mut client,
+        &mut server_input,
+        &mut server_output,
+        &mut server,
+    );
+
+    let mut reject_server_config = make_server_config(kt, &provider);
+    reject_server_config.max_early_data_size = 0;
+    reject_server_config.session_storage = session_storage;
+    let reject_server_config = Arc::new(reject_server_config);
+
+    let mut client_output = Vec::new();
+    let mut server_output = Vec::new();
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&client_config, &reject_server_config, &mut client_output);
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write_tls((&[0xbb; 16_384]).into(), &mut client_output),
+        16_384
+    );
+
+    do_handshake(
+        &mut client_input,
+        &mut client_output,
+        &mut client,
+        &mut server_input,
+        &mut server_output,
+        &mut server,
+    );
+
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert!(server.early_data().is_none());
+    assert!(!client.is_early_data_accepted());
+}
+
 struct ServerStorage {
     storage: Arc<dyn rustls::server::StoresServerSessions>,
     put_count: AtomicUsize,
